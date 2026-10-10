@@ -6,6 +6,14 @@
 >
 > **Lazy-start a local llama.cpp model when DSH needs it, release RAM/VRAM when it doesn't.**
 
+> [!IMPORTANT]
+> **本项目由 AI 编写。** 仓库里的全部代码与文档均由 AI 编码助手产出,不是手写的 ——
+> 运行前请先读 **[AI-DISCLOSURE.md](AI-DISCLOSURE.md)**。仅在作者的一台 Windows 机器上验证过,
+> 无安全审计、无测试套件。
+>
+> **AI-written code.** Every file in this repository was produced by an AI coding agent, not by
+> hand — see **[AI-DISCLOSURE.md](AI-DISCLOSURE.md)** before you run it.
+
 给 [DeepSeek Harness](https://github.com/deepseek-ai) 用的本地大模型管家。它占住你 DSH 本地路由
 已经在连的端口,自己把 `llama-server` 跑在内部端口上 —— **第一次请求才加载模型,闲置一段时间就把
 内存和显存全部还回去**。附带一个 DSH 插件,让这套东西跟着 DSH 一起启停。
@@ -268,6 +276,7 @@ dsh plugin --profile desktop add link:<本仓库>/plugin
 
 ```
 .
+├─ AI-DISCLOSURE.md             AI 编写声明 —— 建议先读这个
 ├─ supervisor/
 │   ├─ supervisor.js            管家本体（Node，零依赖）
 │   └─ models.example.json      配置模板 → 复制成 models.json

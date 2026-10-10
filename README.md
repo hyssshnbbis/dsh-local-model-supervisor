@@ -6,6 +6,14 @@
 >
 > **本地大模型「用到才起、不用就放」:按需冷启动 + 空闲自动释放 + 一个假的上下文上限来兜住压缩。**
 
+> [!IMPORTANT]
+> **AI-written code.** Every file in this repository was produced by an AI coding agent, not by
+> hand — see **[AI-DISCLOSURE.md](AI-DISCLOSURE.md)** before you run it. It was verified on a
+> single Windows machine, with no security review and no test suite.
+>
+> **本项目由 AI 编写。** 全部代码与文档均由 AI 编码助手产出,不是手写的 —— 运行前请先读
+> **[AI-DISCLOSURE.md](AI-DISCLOSURE.md)**。仅在作者的一台 Windows 机器上验证过,无安全审计、无测试套件。
+
 A local-model supervisor for [DeepSeek Harness](https://github.com/deepseek-ai). It occupies the
 ports your DSH local routes already point at and runs `llama-server` on private internal ports:
 the model is loaded on the first request and **all RAM/VRAM is given back once it goes idle**.
@@ -285,6 +293,7 @@ Test machine: RTX 4070 Ti 12 GB · Ryzen 5 9600X · 31 GB RAM · Windows · llam
 
 ```
 .
+├─ AI-DISCLOSURE.md             AI authorship notice — please read this first
 ├─ supervisor/
 │   ├─ supervisor.js            the supervisor itself (Node, zero dependencies)
 │   └─ models.example.json      config template -> copy to models.json
