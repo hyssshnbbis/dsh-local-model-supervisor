@@ -7,11 +7,16 @@
   auto-start behaviour, use unload-local-models.ps1 instead.
 #>
 param(
-    [int[]]$Ports = @(8080, 8081),
+    [string]$Config = '',
+    [int[]]$Ports = @(),
     [switch]$Quiet
 )
 
 $ErrorActionPreference = 'Continue'
+
+# Ports come from the supervisor config so any number of models / any publicBase works.
+. (Join-Path $PSScriptRoot 'supervisor-ports.ps1')
+if (-not $Ports -or $Ports.Count -eq 0) { $Ports = Get-LocalModelPorts -Config $Config }
 
 function Get-GpuFreeMiB {
     $v = (nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>$null | Select-Object -First 1)

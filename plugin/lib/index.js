@@ -36,7 +36,7 @@ const DEFAULTS = {
   supervisorScript: '',
   supervisorConfig: '',          // '' = <supervisor dir>/models.json
   logFile: path.join(os.homedir(), '.dsh', 'local-model-supervisor.log'),
-  publicPorts: [8080],           // the ports your DSH local routes point at
+  publicPorts: [],               // [] = derive from the supervisor config (works for any number of models)
   autoStart: true,
   unloadOnExit: true,
   stopOnExit: false,
@@ -105,8 +105,38 @@ export default {
 
   apply(root, config) {
     const cfg = { ...DEFAULTS, ...(config || root?.config || {}) }
-    const ports = Array.isArray(cfg.publicPorts) ? cfg.publicPorts : [cfg.publicPorts]
     const log = makeLogger(cfg.logFile)
+
+    /**
+     * Which ports to probe for an already-running supervisor.
+     *
+     * An explicit list wins. Otherwise it is derived from the supervisor config, so the plugin
+     * keeps working no matter how many models are declared or which publicBase they start at —
+     * a hardcoded `[8080]` would silently miss the supervisor (and spawn a duplicate) as soon as
+     * the user has three models or moved the port base.
+     *
+     * This mirrors pass 1 of the supervisor's own allocation: `publicPort`, else `publicBase + i`.
+     */
+    function resolvePorts() {
+      if (Array.isArray(cfg.publicPorts) && cfg.publicPorts.length) return cfg.publicPorts
+      if (typeof cfg.publicPorts === 'number') return [cfg.publicPorts]
+      try {
+        const cfgPath = cfg.supervisorConfig
+          || path.join(path.dirname(cfg.supervisorScript || '.'), 'models.json')
+        const raw = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
+        const base = raw?.ports?.publicBase ?? 8080
+        const list = (raw?.models || []).map((m, i) => m.publicPort ?? (base + i))
+        if (list.length) {
+          log(`derived ${list.length} public port(s) from ${cfgPath}: ${list.join(', ')}`)
+          return list
+        }
+      } catch (err) {
+        log(`could not derive public ports from the supervisor config (${err.message})`)
+      }
+      return [8080]
+    }
+
+    const ports = resolvePorts()
 
     let child = null          // the supervisor we spawned, if any
     let disposed = false

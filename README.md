@@ -289,6 +289,29 @@ Test machine: RTX 4070 Ti 12 GB · Ryzen 5 9600X · 31 GB RAM · Windows · llam
 - It listens on `127.0.0.1` only and has no authentication. Put a reverse proxy and auth in front
   of it if you expose it to a network.
 
+### Many models
+
+Nothing is hard-coded to two models: the list takes any number, ports are allocated from
+`publicBase` / `internalBase`, the single-GPU-slot logic loops over every entry, and both the
+plugin and the helper scripts read the resulting port list out of the same config (via
+`supervisor.js --dump-models`) instead of keeping their own hardcoded list. Verified with four
+models (two managed + two external) on deliberately adjacent port bases.
+
+Two things to plan for as the list grows:
+
+- **Every switch between models costs a cold start.** Only one model can be resident on a card
+  that cannot hold two, so A → B stops A and loads B (5–15 s depending on size). A client that
+  hops between models will pay that repeatedly — pin it to one model if you can.
+- **Keep the port ranges clear of your other services.** *N* models occupy
+  `publicBase … publicBase + N − 1`, and the managed ones take the next free ports from
+  `internalBase`. Make sure that does not collide with Ollama's `11434`, LM Studio's `1234`,
+  DSH's own web port, and so on. Duplicates *inside* the config are rejected at startup with a
+  clear error rather than failing later at spawn time.
+
+If you genuinely want two models resident simultaneously, run **two supervisor instances** with
+separate configs and non-overlapping port ranges — each manages its own GPU slot. They still share
+one card, so this only helps when the models really do fit together.
+
 ## 8. Directory structure
 
 ```
@@ -307,6 +330,7 @@ Test machine: RTX 4070 Ti 12 GB · Ryzen 5 9600X · 31 GB RAM · Windows · llam
 │   ├─ supervisor-status.ps1    status
 │   ├─ unload-local-models.ps1  release everything now
 │   ├─ export-dsh-routes.ps1   generate the DSH `providers:` block from models.json
+│   ├─ supervisor-ports.ps1     shared helper: read the port list out of the config
 │   ├─ install-autostart.ps1    start at logon (scheduled task; unnecessary once the plugin is used)
 │   └─ uninstall-autostart.ps1  remove it
 └─ LICENSE

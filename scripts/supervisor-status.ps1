@@ -3,9 +3,16 @@
   supervisor-status.ps1 - show what the local-model supervisor currently has loaded,
   how long until each model is released, and the live GPU state.
 #>
-param([int[]]$Ports = @(8080, 8081))
+param(
+    [string]$Config = '',
+    [int[]]$Ports = @()
+)
 
 $ErrorActionPreference = 'Continue'
+
+# Ports come from the supervisor config so any number of models / any publicBase works.
+. (Join-Path $PSScriptRoot 'supervisor-ports.ps1')
+if (-not $Ports -or $Ports.Count -eq 0) { $Ports = Get-LocalModelPorts -Config $Config }
 
 $status = $null
 $viaPort = $null

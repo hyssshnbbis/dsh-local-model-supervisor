@@ -272,6 +272,24 @@ dsh plugin --profile desktop add link:<本仓库>/plugin
 - 管家进程不占显存,但**会被空闲回收逻辑排除在外** —— 它必须常驻才能「按需拉起」。
 - 只监听 `127.0.0.1`,没有鉴权。要暴露到网络请自行加反向代理和鉴权。
 
+### 模型数量多了会怎样
+
+**没有写死只有两个模型。** 清单接受任意数量:端口从 `publicBase` / `internalBase` 自动分配、
+单卡串行逻辑遍历每一项,而且插件和几个辅助脚本都改成从**同一份配置**读端口
+(通过 `supervisor.js --dump-models`),不再各自硬编码一份端口表。已用 4 个模型
+(2 个托管 + 2 个外部)、且故意把 base 设成相邻的方式实测通过。
+
+清单变长时有两件事要提前规划:
+
+- **每切换一次模型都要付一次冷启动。** 一张卡装不下两个,所以 A → B 会先停 A 再加载 B
+  (视大小约 5~15 秒)。客户端如果在模型之间来回跳,就会反复付这个代价 —— 尽量把它固定在一个模型上。
+- **端口段要避开你机器上的其他服务。** *N* 个模型占 `publicBase … publicBase + N − 1`,
+  托管模型再从 `internalBase` 往上取空闲端口。注意别和 Ollama 的 `11434`、LM Studio 的 `1234`、
+  DSH 自己的 Web 端口等撞上。**配置内部**的重复会在启动时报明确错误,不会拖到拉起进程才失败。
+
+如果你确实想让两个模型**同时驻留**,可以起**两个管家实例**,各自用独立配置和互不重叠的端口段,
+每个管自己的一个 GPU 槽位。但它们仍然共用一张卡,所以只有在这两个模型真的装得下时才有意义。
+
 ## 8. 目录结构
 
 ```
@@ -290,6 +308,7 @@ dsh plugin --profile desktop add link:<本仓库>/plugin
 │   ├─ supervisor-status.ps1    状态
 │   ├─ unload-local-models.ps1  立刻释放
 │   ├─ export-dsh-routes.ps1   从 models.json 生成 DSH 的 `providers:` 配置块
+│   ├─ supervisor-ports.ps1    共享助手:从配置里读端口列表
 │   ├─ install-autostart.ps1    登录自动启动（计划任务，装插件后可省）
 │   └─ uninstall-autostart.ps1  取消
 └─ LICENSE

@@ -224,8 +224,6 @@ function parseCtxSize(m) {
   return 0;
 }
 
-const byPublicPort = new Map(cfg.models.map((m) => [m.publicPort, m]));
-
 /* ------------------------------------------------------- process helpers */
 
 function isRunning(m) {
