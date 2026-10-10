@@ -1,19 +1,34 @@
 {
-  "_comment": "Copy this to models.json and edit. publicPort is what DSH/clients connect to (the supervisor owns it); internalPort is where the supervisor itself launches llama-server. The two sets must not overlap.",
+  "_comment": "One unified list for every local model source. Copy to models.json and edit. Only 'name' plus either 'path' or 'url' is required per entry — ports are allocated automatically and the rest comes from 'defaults'.",
 
   "idleTimeoutSec": 500,
   "checkIntervalSec": 5,
   "startTimeoutSec": 300,
   "stopGraceSec": 20,
 
-  "_softContextLimit_comment": "softContextLimit is a FAKE ceiling below the model's real --ctx-size. A request above it is rejected with llama.cpp's own exceed_context_size_error, which DSH classifies as CONTEXT_WINDOW_EXCEEDED and answers by compacting. The gap between it and the real window is the redundancy that lets the summarization request run. 0 disables it. It must stay ABOVE DSH's own proactive-compaction trigger, or it would also block the summarization replay.",
+  "_softContextLimit_comment": "softContextLimit is a FAKE ceiling below a model's real --ctx-size. A request above it is rejected with llama.cpp's own exceed_context_size_error, which DSH classifies as CONTEXT_WINDOW_EXCEEDED and answers by compacting. The gap between it and the real window is the redundancy that lets the summarization request run. 0 disables it. It must stay ABOVE DSH's own proactive-compaction trigger, or it would also block the summarization replay.",
   "softGraceSec": 180,
   "startSettleSec": 1.5,
 
-  "common": {
+  "_ports_comment": "Public ports are handed out as publicBase + index, internal ports as internalBase + index. Set publicPort / internalPort on an entry to override.",
+  "ports": {
+    "publicBase": 8080,
+    "internalBase": 9080
+  },
+
+  "_defaults_comment": "Applied to every managed model that does not override the field. softContextRatio derives softContextLimit from ctxSize (0.75 x 32768 = 24576).",
+  "defaults": {
+    "ctxSize": 32768,
+    "cacheTypeK": "q8_0",
+    "cacheTypeV": "q4_0",
+    "fitTargetMiB": 1024,
+    "softContextRatio": 0.75
+  },
+
+  "_llamaServer_comment": "How to launch llama-server. 'common' is accepted as an alias for backwards compatibility. Keep --host out of the per-model args since the supervisor supplies --port itself.",
+  "llamaServer": {
     "bin": "C:\\path\\to\\llama.cpp\\llama-server.exe",
     "args": [
-      "--alias", "local-model",
       "--host", "127.0.0.1",
       "--threads", "8",
       "--parallel", "1",
@@ -35,19 +50,26 @@
 
   "models": [
     {
-      "key": "model-a",
-      "label": "Example model (Q4)",
-      "alias": "model-a",
-      "publicPort": 8080,
-      "internalPort": 9080,
-      "softContextLimit": 24576,
-      "model": "C:\\path\\to\\models\\model-a.gguf",
-      "args": [
-        "--ctx-size", "32768",
-        "--cache-type-k", "q8_0",
-        "--cache-type-v", "q4_0",
-        "--fit-target", "1024"
-      ]
+      "_comment": "Managed: the supervisor spawns llama-server for this file, cold-starts it on the first request and releases it when idle. Gets public port 8080 -> internal 9080.",
+      "name": "qwen-2bit",
+      "path": "D:\\models\\Qwen-2bit.gguf"
+    },
+    {
+      "_comment": "Managed, second slot (public 8081 -> internal 9081), with per-model overrides.",
+      "name": "qwen-4bit",
+      "path": "D:\\models\\Qwen-4bit.gguf",
+      "ctxSize": 16384,
+      "mtp": true
+    },
+    {
+      "_comment": "External: an already-running OpenAI-compatible server. Forwarded to on public port 8082; never started or stopped by the supervisor (no idle release for these).",
+      "name": "ollama",
+      "url": "http://127.0.0.1:11434/v1"
+    },
+    {
+      "_comment": "External, second one (public 8083).",
+      "name": "lmstudio",
+      "url": "http://127.0.0.1:1234/v1"
     }
   ]
 }

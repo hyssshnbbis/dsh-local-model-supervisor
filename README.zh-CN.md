@@ -38,6 +38,9 @@ DSH 的本地路由走 `@deepseek-ai/dsh-llm-pi-ai`,配置里只有 `api: openai
 
 | 功能 | 说明 |
 |---|---|
+| **一份统一清单** | 任意多个本地模型写在一个列表里。给 **`path`** 就由管家托管进程;给 **`url`** 就只转发到你已经在跑的服务(Ollama / LM Studio / vLLM…)。每项两个字段就够 |
+| **端口自动分配** | 第 *i* 个模型占 `publicBase + i`;托管模型从 `internalBase` 往上取第一个空闲端口,已占用的自动跳过。冲突在**启动时**就报错,不会拖到拉起进程才失败 |
+| **路由自动生成** | `scripts/export-dsh-routes.ps1` 把清单变成可直接粘贴的 DSH `providers:` 块,导入模型不用手写 YAML |
 | **按需冷启动** | 第一次推理请求时拉起 llama-server,等它健康后转发;客户端无需重试 |
 | **空闲自动释放** | 无请求达 `idleTimeoutSec`(默认 500s)就杀掉进程,**内存和显存一起归还**。计时从最后一个请求结束开始,长生成不会被腰斩 |
 | **元数据请求不唤醒** | `/health`、`/v1/models` 由管家直接合成应答;`/props`、`/metrics` 未加载时返回 503。**否则一个轮询的客户端就能让显存永远不释放** |
@@ -62,29 +65,64 @@ DSH 的本地路由走 `@deepseek-ai/dsh-llm-pi-ai`,配置里只有 `api: openai
 cp supervisor/models.example.json supervisor/models.json
 ```
 
-编辑 `supervisor/models.json`,最关键的几项:
+`models` 是**一份统一清单**,同时接受两种本地模型来源。每一项只要有 `name`,外加 `path` 或 `url` 就够了:
 
 ```jsonc
 {
-  "idleTimeoutSec": 500,          // 多久不用就释放
-  "common": {
-    "bin": "C:\\path\\to\\llama-server.exe",
-    "args": [ "--alias", "local-model", "--host", "127.0.0.1", "--threads", "8", ... ]
+  "idleTimeoutSec": 500,                       // 多久不用就释放
+  "ports": { "publicBase": 8080, "internalBase": 9080 },
+
+  "defaults": {                                // 作用于每个「托管」模型
+    "ctxSize": 32768,
+    "cacheTypeK": "q8_0",
+    "cacheTypeV": "q4_0",
+    "softContextRatio": 0.75                   // softContextLimit = ctxSize × 这个比例
   },
+
+  "llamaServer": {
+    "bin": "C:\\path\\to\\llama-server.exe",
+    "args": [ "--host", "127.0.0.1", "--threads", "8", "--flash-attn", "on", "--jinja", ... ]
+  },
+
   "models": [
-    {
-      "key": "model-a",
-      "publicPort": 8080,          // DSH 路由指向这里（管家占用）
-      "internalPort": 9080,        // 管家自己拉起 llama-server 用的端口（别和别人撞）
-      "softContextLimit": 24576,   // 假上限，见第 5 节；0 = 关闭
-      "model": "C:\\path\\to\\models\\model-a.gguf",
-      "args": ["--ctx-size", "32768", "--cache-type-k", "q8_0", "--cache-type-v", "q4_0"]
-    }
+    { "name": "qwen-2bit", "path": "D:\\models\\Qwen-2bit.gguf" },
+    { "name": "qwen-4bit", "path": "D:\\models\\Qwen-4bit.gguf", "ctxSize": 16384, "mtp": true },
+    { "name": "ollama",    "url":  "http://127.0.0.1:11434/v1" },
+    { "name": "lmstudio",  "url":  "http://127.0.0.1:1234/v1" }
   ]
 }
 ```
 
-### 3.3 跑起来
+| 写法 | 行为 |
+|---|---|
+| **`path`** — 托管 | 管家自己拉起 llama-server,第一次请求才加载,**闲置后把内存和显存都还回去** |
+| **`url`** — 外部 | 你已经在跑的 OpenAI 兼容服务(Ollama / LM Studio / vLLM / 别的 llama.cpp)。管家只在自己的公开端口上**转发**过去,**不会**启停它,所以这类条目没有空闲释放 |
+
+**端口自动分配。** 第 *i* 项占 `publicBase + i`;托管项从 `internalBase` 开始往上找**第一个没被占用的**端口
+(所以就算你把 base 设成相邻的 8080 / 8081,也绝不会把同一个端口分给两样东西)。
+想自己指定就写 `publicPort` / `internalPort`;真重复了会在**启动时**报明确错误,而不是等到拉起进程才失败。
+
+**向后兼容。** `common` 仍可作为 `llamaServer` 的别名,老的显式写法
+(每项写 `publicPort` / `internalPort` / `model` / `args`)也原样可用。
+
+### 3.3 生成 DSH 路由
+
+只声明模型还不够 —— DSH 那边还得有一条指向它的路由,而给每个模型手写 YAML 不可扩展。
+用同一个配置直接生成:
+
+```powershell
+pwsh -File scripts/export-dsh-routes.ps1                          # 打印到 stdout
+pwsh -File scripts/export-dsh-routes.ps1 -OutFile ..\routes.yml   # 或写到文件
+```
+
+它会输出一段可直接粘贴的 `providers:` 块 —— 每个模型一条路由,指向该模型的管家公开端口,
+`contextWindow` 自动取 `ctxSize`。粘到 DSH profile patch 里的
+`- id: llm-pi-ai` → `config:` → `providers:` 下面,然后重启 DSH。
+
+生成器是通过 `supervisor.js --dump-models` 读配置的,所以端口分配和默认值的规则**只有一份**,
+不会和管家实际行为脱节。
+
+### 3.4 跑起来
 
 ```powershell
 # 前台（Ctrl+C 停止）
@@ -99,7 +137,7 @@ pwsh -File scripts/stop-supervisor.ps1       # 停掉管家
 
 然后把 DSH 的本地路由 `baseURL` 指向 `http://127.0.0.1:8080/v1` 即可。
 
-### 3.4 装 DSH 插件(可选,但推荐)
+### 3.5 装 DSH 插件(可选,但推荐)
 
 插件让管家跟着 DSH 一起启停,并加一个 `/localmodel` 命令:
 
@@ -124,10 +162,20 @@ dsh plugin --profile desktop add link:<本仓库>/plugin
 | `stopGraceSec` | `20` | 停止进程的等待上限 |
 | `softGraceSec` | `180` | 软上限拦下后的压缩宽限期(见第 5 节) |
 | `startSettleSec` | `1.5` | 启动预热后的沉降等待 |
-| `models[].publicPort` | — | 客户端连接的端口(管家占用) |
-| `models[].internalPort` | — | llama-server 实际监听的端口 |
-| `models[].softContextLimit` | `0` | 假上下文上限,`0` = 关闭 |
-| `models[].model` / `args` | — | 权重路径与追加参数 |
+| `models[].name` / `key` | — | 条目标识(也是默认别名) |
+| `models[].path` | — | **托管**:要服务的 `.gguf` 文件 |
+| `models[].url` | — | **外部**:已在运行的 OpenAI 兼容 base URL(如 `http://127.0.0.1:11434/v1`) |
+| `models[].publicPort` | `publicBase + i` | 客户端连接的端口(管家占用) |
+| `models[].internalPort` | `internalBase` 起第一个空闲端口 | llama-server 实际监听的端口(仅托管项) |
+| `models[].alias` | `key`(或 `--alias` 参数) | `/v1/models` 报告的模型 id |
+| `models[].ctxSize` | `defaults.ctxSize` | 托管项的上下文窗口 |
+| `models[].cacheTypeK` / `cacheTypeV` | `defaults.*` | KV 缓存量化 |
+| `models[].mtp` | 关 | 追加 `--spec-type draft-mtp`(模型含 NextN 头才划算) |
+| `models[].softContextLimit` | `ctxSize × softContextRatio` | 假上下文上限,`0` = 关闭 |
+| `models[].args` | 自动生成 | 进阶/兼容逃生口:直接原样传给 llama-server |
+| `ports.publicBase` / `ports.internalBase` | `8080` / `9080` | 自动分配端口的起点 |
+| `defaults.*` | 见模板 | 托管项的字段默认值 |
+| `llamaServer.bin` / `.args` | — | 怎么启动 llama-server(`common` 是兼容别名) |
 
 ### 控制端点(每个公开端口上都有)
 
@@ -232,6 +280,7 @@ dsh plugin --profile desktop add link:<本仓库>/plugin
 │   ├─ stop-supervisor.ps1      停掉管家
 │   ├─ supervisor-status.ps1    状态
 │   ├─ unload-local-models.ps1  立刻释放
+│   ├─ export-dsh-routes.ps1   从 models.json 生成 DSH 的 `providers:` 配置块
 │   ├─ install-autostart.ps1    登录自动启动（计划任务，装插件后可省）
 │   └─ uninstall-autostart.ps1  取消
 └─ LICENSE

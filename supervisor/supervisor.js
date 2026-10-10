@@ -66,6 +66,138 @@ function log(msg) {
   try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch { /* logging must never crash us */ }
 }
 
+/* --------------------------------------------------- model list normalization */
+
+// ONE unified list accepts both kinds of local model source:
+//
+//   { "name": "a", "path": "D:\\models\\a.gguf" }         -> the supervisor spawns llama-server,
+//                                                             cold-starts it and releases it when idle
+//   { "name": "b", "url": "http://127.0.0.1:11434/v1" }   -> an already-running OpenAI-compatible
+//                                                             server (Ollama, LM Studio, vLLM, another
+//                                                             llama.cpp): forwarded to, never stopped
+//
+// Ports are allocated automatically unless an entry sets them explicitly, and the legacy explicit
+// schema (publicPort / internalPort / model / args) keeps working unchanged.
+const COMMON = cfg.common || cfg.llamaServer || {};
+const PORT_BASE_PUBLIC = cfg.ports?.publicBase ?? 8080;
+const PORT_BASE_INTERNAL = cfg.ports?.internalBase ?? 9080;
+const DEFAULTS = cfg.defaults || {};
+const DEFAULT_SOFT_RATIO = DEFAULTS.softContextRatio ?? 0.75;
+
+/** Last value of a CLI flag inside an args array. */
+function argValue(args, flag) {
+  const a = Array.isArray(args) ? args : [];
+  const i = a.lastIndexOf(flag);
+  return i >= 0 ? a[i + 1] : undefined;
+}
+
+/** Split an OpenAI-compatible base URL into host / port / path. */
+function parseTarget(url) {
+  const u = new URL(url);
+  let base = u.pathname.replace(/\/+$/, '');
+  if (!base) base = '/v1';                 // "http://host:port" means the usual /v1 base
+  const port = Number(u.port || (u.protocol === 'https:' ? 443 : 80));
+  return { host: u.hostname, port, base };
+}
+
+function normalizeModels(list) {
+  const raws = list || [];
+
+  // ---- pass 1: public ports (every model gets one) --------------------------------------
+  const usedPorts = new Set();
+  const publicPorts = raws.map((raw, i) => {
+    const p = raw.publicPort ?? (PORT_BASE_PUBLIC + i);
+    if (!Number.isInteger(p) || p < 1 || p > 65535) throw new Error(`"${raw.name || raw.key || i}" has an invalid publicPort: ${raw.publicPort}`);
+    if (usedPorts.has(p)) throw new Error(`public port ${p} is claimed more than once — set "publicPort" explicitly to resolve it`);
+    usedPorts.add(p);
+    return p;
+  });
+
+  // ---- pass 2: internal ports (managed models only), skipping anything already claimed ----
+  return raws.map((raw, i) => {
+    const m = { ...raw };
+    m.key = raw.key || raw.name || `model-${i + 1}`;
+    m.label = raw.label || m.key;
+    m.publicPort = publicPorts[i];
+    m.external = !!raw.url;
+
+    if (m.external) {
+      const t = parseTarget(raw.url);
+      m.targetHost = t.host;
+      m.targetPort = t.port;
+      m.targetBase = t.base;
+      m.alias = raw.alias || m.key;
+      m.ctxSize = raw.ctxSize ?? null;       // unknown unless the user declares it
+    } else {
+      if (raw.internalPort != null) {
+        if (usedPorts.has(raw.internalPort)) throw new Error(`internal port ${raw.internalPort} of "${m.key}" is already taken`);
+        m.internalPort = raw.internalPort;
+      } else {
+        // Walk up from the base until a free port is found, so a public/internal base pair that
+        // overlaps (8080 / 8081, say) can never hand the same port to two things.
+        let p = PORT_BASE_INTERNAL;
+        while (usedPorts.has(p)) p++;
+        m.internalPort = p;
+      }
+      usedPorts.add(m.internalPort);
+
+      m.model = raw.path || raw.model;
+      if (!m.model) throw new Error(`model "${m.key}" needs either "path" (a .gguf file) or "url"`);
+      if (Array.isArray(raw.args)) {
+        m.args = raw.args;                   // advanced/legacy: exactly what the user wrote
+        // Keep the id llama-server is actually told to serve under, so /v1/models stays truthful.
+        m.alias = raw.alias || argValue(m.args, '--alias') || argValue(COMMON.args, '--alias') || m.key;
+      } else {
+        // Simple schema: only "path" is required; everything else comes from `defaults`.
+        // Each model gets its own --alias so several managed models stay distinguishable.
+        m.alias = raw.alias || m.key;
+        const ctx = raw.ctxSize ?? DEFAULTS.ctxSize ?? 32768;
+        m.ctxSize = ctx;
+        m.args = [
+          '--alias', m.alias,
+          '--ctx-size', String(ctx),
+          '--cache-type-k', String(raw.cacheTypeK ?? DEFAULTS.cacheTypeK ?? 'q8_0'),
+          '--cache-type-v', String(raw.cacheTypeV ?? DEFAULTS.cacheTypeV ?? 'q4_0'),
+          '--fit-target', String(raw.fitTargetMiB ?? DEFAULTS.fitTargetMiB ?? 1024),
+        ];
+        if (raw.mtp) m.args.push('--spec-type', 'draft-mtp', '--spec-draft-n-max', String(raw.specDraftNMax ?? 2));
+      }
+    }
+
+    // Effective "fake" context ceiling: explicit > global > ratio of the model's window
+    // (see the header). External servers are never policed unless the user sets it explicitly.
+    if (m.softContextLimit === undefined || m.softContextLimit === null) m.softContextLimit = cfg.softContextLimit;
+    if (m.softContextLimit === undefined || m.softContextLimit === null) {
+      const ratio = raw.softContextRatio ?? DEFAULT_SOFT_RATIO;
+      const real = m.external ? 0 : (m.ctxSize ?? parseCtxSize(m));
+      m.softContextLimit = (!m.external && real > 0 && ratio > 0) ? Math.floor(real * ratio) : 0;
+    }
+    return m;
+  });
+}
+
+cfg.models = normalizeModels(cfg.models);
+
+// `node supervisor.js <config> --dump-models` prints the normalized model list and exits.
+// Route/config generators consume this so the normalization rules live in exactly one place.
+if (process.argv.includes('--dump-models')) {
+  process.stdout.write(JSON.stringify({
+    idleTimeoutSec: cfg.idleTimeoutSec ?? 500,
+    models: cfg.models.map((m) => ({
+      key: m.key,
+      label: m.label,
+      alias: m.alias,
+      external: !!m.external,
+      publicPort: m.publicPort,
+      internalPort: m.internalPort ?? null,
+      url: m.external ? `http://${m.targetHost}:${m.targetPort}${m.targetBase}` : null,
+      ctxSize: m.ctxSize ?? (m.external ? null : parseCtxSize(m) || null),
+      softContextLimit: m.softContextLimit ?? null,
+    })),
+  }, null, 2) + '\n');
+  process.exit(0);
+}
+
 /* ------------------------------------------------------------------ state */
 
 for (const m of cfg.models) {
@@ -74,19 +206,16 @@ for (const m of cfg.models) {
   m.lastUsed = Date.now();
   m.active = 0;           // requests currently being proxied
   m.lastError = null;
-  // Model id reported by the synthetic /v1/models reply. Defaults to the config key; set
-  // "alias" per model when your client matches on a specific model name.
-  m.alias = m.alias || m.key;
-  // "Fake" context ceiling below the real --ctx-size; 0 disables the check.
-  m.softContextLimit = m.softContextLimit ?? cfg.softContextLimit ?? 0;
-  m.realContextLimit = parseCtxSize(m);
   m.softGraceUntil = 0;   // while in the future, the ceiling is not enforced
+  // The real window, taken from the launch args so it can never drift from what llama-server
+  // was actually started with.
+  m.realContextLimit = m.external ? 0 : parseCtxSize(m);
 }
 
 // The real window, taken from the launch args so it can never drift from what llama-server
 // was actually started with.
 function parseCtxSize(m) {
-  const all = [...(cfg.common.args || []), ...(m.args || [])];
+  const all = [...(COMMON.args || []), ...(m.args || [])];
   const i = all.lastIndexOf('--ctx-size');
   if (i >= 0 && all[i + 1] !== undefined) {
     const n = parseInt(all[i + 1], 10);
@@ -100,7 +229,25 @@ const byPublicPort = new Map(cfg.models.map((m) => [m.publicPort, m]));
 /* ------------------------------------------------------- process helpers */
 
 function isRunning(m) {
+  // An external server is not ours to manage: treat it as always available and let any real
+  // connection problem surface as a 502 instead of us trying to spawn something.
+  if (m.external) return true;
   return !!(m.proc && m.proc.exitCode === null && !m.proc.killed);
+}
+
+/** Where a request for this model actually goes on the wire. */
+function upstreamFor(m, reqPath) {
+  const p = reqPath || '/';
+  if (m.external) {
+    const tail = p.startsWith('/v1') ? p.slice(3) : p;
+    return {
+      host: m.targetHost,
+      port: m.targetPort,
+      path: m.targetBase + (tail.startsWith('/') ? tail : '/' + tail),
+      hostHeader: `${m.targetHost}:${m.targetPort}`,
+    };
+  }
+  return { host: '127.0.0.1', port: m.internalPort, path: p, hostHeader: `127.0.0.1:${m.internalPort}` };
 }
 
 // Ask llama-server's own /health whether it is serving. Never throws.
@@ -151,6 +298,7 @@ function killTree(pid) {
 }
 
 async function stopModel(m, reason) {
+  if (m.external) { log(`[${m.key}] external model (${m.targetHost}:${m.targetPort}) — not ours to stop, leaving it alone`); return; }
   if (!isRunning(m)) { m.proc = null; return; }
   const pid = m.proc.pid;
   log(`[${m.key}] stopping (pid ${pid}, reason: ${reason})`);
@@ -172,6 +320,7 @@ async function stopModel(m, reason) {
 }
 
 async function startModel(m) {
+  if (m.external) return;                      // it is already running somewhere else
   if (isRunning(m) && (await probeHealth(m))) return;
 
   // single GPU slot: a second 27B model cannot coexist on this card
@@ -188,11 +337,12 @@ async function startModel(m) {
     const args = [
       '--model', m.model,
       '--port', String(m.internalPort),
-      ...(cfg.common.args || []),
+      ...(COMMON.args || []),
       ...(m.args || []),
     ];
-    log(`[${m.key}] starting ${cfg.common.bin}`);
-    const proc = spawn(cfg.common.bin, args, {
+    if (!COMMON.bin) throw new Error('no llama-server binary configured — set "llamaServer.bin" (or the legacy "common.bin") in the config');
+    log(`[${m.key}] starting ${COMMON.bin}`);
+    const proc = spawn(COMMON.bin, args, {
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -246,11 +396,12 @@ async function startModel(m) {
 /* ---------------------------------------------------------------- proxying */
 
 function proxyTo(m, req, res) {
+  const target = upstreamFor(m, req.url);
   const headers = { ...req.headers };
-  headers.host = `127.0.0.1:${m.internalPort}`;
+  headers.host = target.hostHeader;
 
   const upstream = http.request(
-    { host: '127.0.0.1', port: m.internalPort, method: req.method, path: req.url, headers },
+    { host: target.host, port: target.port, method: req.method, path: target.path, headers },
     (up) => {
       res.writeHead(up.statusCode || 502, up.headers);
       up.pipe(res);                       // stream through: SSE works untouched
@@ -298,8 +449,9 @@ function readBody(req) {
 // ceiling is an optimisation and must never break traffic on its own.
 function countInputTokens(m, bodyBuf) {
   return new Promise((resolve) => {
+    const target = upstreamFor(m, '/v1/chat/completions/input_tokens');
     const req = http.request({
-      host: '127.0.0.1', port: m.internalPort, path: '/v1/chat/completions/input_tokens',
+      host: target.host, port: target.port, path: target.path,
       method: 'POST',
       headers: { 'content-type': 'application/json', 'content-length': bodyBuf.length },
       timeout: 30000,
@@ -340,13 +492,14 @@ function syntheticOverflow(m, res, n) {
 // anything was committed to the client (in which case the caller may retry).
 function sendBuffered(m, req, res, body) {
   return new Promise((resolve) => {
+    const target = upstreamFor(m, req.url);
     const headers = { ...req.headers };
-    headers.host = `127.0.0.1:${m.internalPort}`;
+    headers.host = target.hostHeader;
     delete headers['transfer-encoding'];
     headers['content-length'] = body.length;
 
     const upstream = http.request(
-      { host: '127.0.0.1', port: m.internalPort, method: req.method, path: req.url, headers },
+      { host: target.host, port: target.port, method: req.method, path: target.path, headers },
       (up) => {
         res.writeHead(up.statusCode || 502, up.headers);
         up.pipe(res);
@@ -431,8 +584,10 @@ function statusPayload() {
     models: cfg.models.map((m) => ({
       key: m.key,
       label: m.label,
+      external: !!m.external,
+      url: m.external ? `http://${m.targetHost}:${m.targetPort}${m.targetBase}` : null,
       publicPort: m.publicPort,
-      internalPort: m.internalPort,
+      internalPort: m.internalPort ?? null,
       softContextLimit: m.softContextLimit || null,
       realContextLimit: m.realContextLimit || null,
       graceActive: Date.now() < m.softGraceUntil,
@@ -440,7 +595,7 @@ function statusPayload() {
       starting: !!m.starting,
       activeRequests: m.active,
       idleSec: m.lastUsed ? Math.round((now - m.lastUsed) / 1000) : null,
-      stopInSec: isRunning(m) && m.active === 0
+      stopInSec: !m.external && isRunning(m) && m.active === 0
         ? Math.max(0, Math.round((IDLE_MS - (now - m.lastUsed)) / 1000))
         : null,
       lastError: m.lastError,
@@ -549,7 +704,11 @@ for (const m of cfg.models) {
   });
 
   server.listen(m.publicPort, '127.0.0.1', () => {
-    log(`[${m.key}] listening on 127.0.0.1:${m.publicPort} -> internal ${m.internalPort} (${m.label})`);
+    if (m.external) {
+      log(`[${m.key}] listening on 127.0.0.1:${m.publicPort} -> external http://${m.targetHost}:${m.targetPort}${m.targetBase} (${m.label})`);
+    } else {
+      log(`[${m.key}] listening on 127.0.0.1:${m.publicPort} -> internal ${m.internalPort} (${m.label})`);
+    }
   });
 }
 
@@ -558,7 +717,7 @@ for (const m of cfg.models) {
 setInterval(async () => {
   const now = Date.now();
   for (const m of cfg.models) {
-    if (!isRunning(m) || m.active > 0 || m.starting) continue;
+    if (m.external || !isRunning(m) || m.active > 0 || m.starting) continue;
     if (now - m.lastUsed >= IDLE_MS) {
       log(`[${m.key}] idle for ${Math.round((now - m.lastUsed) / 1000)}s (>= ${IDLE_MS / 1000}s) -> releasing VRAM`);
       await stopModel(m, 'idle timeout');

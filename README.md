@@ -37,6 +37,9 @@ has to change at all**, and curl / Python / any other client gets the same behav
 
 | Feature | Description |
 |---|---|
+| **One unified model list** | Declare any number of local models in a single list. Give a **`path`** and the supervisor manages the process; give a **`url`** and it just forwards to a server you already run (Ollama, LM Studio, vLLM, …). Two fields per entry is enough. |
+| **Ports allocated automatically** | The *i*-th model takes `publicBase + i`; managed models take the next free port at or above `internalBase`, skipping anything claimed. Collisions are rejected at startup, never at spawn time. |
+| **Routes generated for you** | `scripts/export-dsh-routes.ps1` turns the list into a ready-to-paste DSH `providers:` block, so importing a model does not mean hand-writing YAML. |
 | **Cold start on demand** | The first inference request spawns llama-server, waits for health, then proxies. Clients never need to retry. |
 | **Idle release** | After `idleTimeoutSec` (default 500s) with no requests the process is killed and **both RAM and VRAM are returned**. The countdown starts when the last request *ends*, so long generations are never cut off. |
 | **Metadata never wakes the GPU** | `/health` and `/v1/models` are answered synthetically; `/props` and `/metrics` return 503 while unloaded. **Otherwise a client polling `/v1/models` would pin the VRAM forever.** |
@@ -61,30 +64,67 @@ has to change at all**, and curl / Python / any other client gets the same behav
 cp supervisor/models.example.json supervisor/models.json
 ```
 
-Edit `supervisor/models.json` — the essential parts:
+`models` is **one unified list** that accepts both kinds of local model source. All an entry needs
+is a `name` plus either `path` or `url`:
 
 ```jsonc
 {
-  "idleTimeoutSec": 500,          // how long before the model is released
-  "common": {
-    "bin": "C:\\path\\to\\llama-server.exe",
-    "args": [ "--alias", "local-model", "--host", "127.0.0.1", "--threads", "8", ... ]
+  "idleTimeoutSec": 500,                       // how long before a model is released
+  "ports": { "publicBase": 8080, "internalBase": 9080 },
+
+  "defaults": {                                // applied to every managed model
+    "ctxSize": 32768,
+    "cacheTypeK": "q8_0",
+    "cacheTypeV": "q4_0",
+    "softContextRatio": 0.75                   // softContextLimit = ctxSize * this
   },
+
+  "llamaServer": {
+    "bin": "C:\\path\\to\\llama-server.exe",
+    "args": [ "--host", "127.0.0.1", "--threads", "8", "--flash-attn", "on", "--jinja", ... ]
+  },
+
   "models": [
-    {
-      "key": "model-a",
-      "alias": "model-a",          // id reported by /v1/models
-      "publicPort": 8080,          // what DSH points at (the supervisor owns it)
-      "internalPort": 9080,        // where the supervisor launches llama-server (must not collide)
-      "softContextLimit": 24576,   // fake ceiling, see section 5; 0 disables
-      "model": "C:\\path\\to\\models\\model-a.gguf",
-      "args": ["--ctx-size", "32768", "--cache-type-k", "q8_0", "--cache-type-v", "q4_0"]
-    }
+    { "name": "qwen-2bit", "path": "D:\\models\\Qwen-2bit.gguf" },
+    { "name": "qwen-4bit", "path": "D:\\models\\Qwen-4bit.gguf", "ctxSize": 16384, "mtp": true },
+    { "name": "ollama",    "url":  "http://127.0.0.1:11434/v1" },
+    { "name": "lmstudio",  "url":  "http://127.0.0.1:1234/v1" }
   ]
 }
 ```
 
-### 3.3 Run it
+| Entry | Behaviour |
+|---|---|
+| **`path`** — managed | The supervisor spawns llama-server for that file, cold-starts it on the first request and releases RAM/VRAM when idle. |
+| **`url`** — external | An already-running OpenAI-compatible server (Ollama, LM Studio, vLLM, another llama.cpp). The supervisor only **forwards** to it on its own public port; it is never started or stopped, so external entries get no idle release. |
+
+**Ports are handed out for you.** The *i*-th entry takes `publicBase + i`, and each managed entry
+takes the next free port at or above `internalBase` — skipping anything already claimed, so even a
+deliberately overlapping base pair (8080 / 8081) can never hand the same port to two things.
+Set `publicPort` / `internalPort` on an entry to override; genuine duplicates are rejected at
+startup with a clear error instead of failing later at spawn time.
+
+**Backwards compatible.** `common` is still accepted as an alias for `llamaServer`, and the legacy
+explicit schema (`publicPort` / `internalPort` / `model` / `args` per entry) keeps working unchanged.
+
+### 3.3 Generate the DSH routes
+
+Declaring a model is only half the job — DSH also needs a route pointing at it, and hand-writing
+YAML for every model does not scale. Generate it from the same config instead:
+
+```powershell
+pwsh -File scripts/export-dsh-routes.ps1                          # print to stdout
+pwsh -File scripts/export-dsh-routes.ps1 -OutFile ..\routes.yml   # or write it to a file
+```
+
+It emits a ready-to-paste `providers:` block — one route per model, pointing at that model's
+supervisor public port, with `contextWindow` filled from `ctxSize`. Paste it under
+`- id: llm-pi-ai` → `config:` → `providers:` in your DSH profile patch, then restart DSH.
+
+The generator reads the config through `supervisor.js --dump-models`, so the allocation and
+defaulting rules live in exactly one place and cannot drift from what the supervisor actually does.
+
+### 3.4 Run it
 
 ```powershell
 # Foreground (Ctrl+C to stop)
@@ -99,7 +139,7 @@ pwsh -File scripts/stop-supervisor.ps1       # stop the supervisor itself
 
 Then point your DSH local route's `baseURL` at `http://127.0.0.1:8080/v1`.
 
-### 3.4 Install the DSH plugin (optional, recommended)
+### 3.5 Install the DSH plugin (optional, recommended)
 
 The plugin makes the supervisor start and stop with DSH and adds a `/localmodel` command:
 
@@ -126,11 +166,20 @@ line in the plugin log.
 | `stopGraceSec` | `20` | Wait limit when stopping a process |
 | `softGraceSec` | `180` | Compaction grace window after a soft-ceiling rejection (section 5) |
 | `startSettleSec` | `1.5` | Settle delay after the warm-up request |
-| `models[].publicPort` | — | Port clients connect to (owned by the supervisor) |
-| `models[].internalPort` | — | Port llama-server actually listens on |
-| `models[].alias` | `key` | Model id reported by the synthetic `/v1/models` |
-| `models[].softContextLimit` | `0` | Fake context ceiling; `0` disables |
-| `models[].model` / `args` | — | Weight path and extra arguments |
+| `models[].name` / `key` | — | Identifier for the entry (also the default alias) |
+| `models[].path` | — | **Managed**: the `.gguf` file to serve |
+| `models[].url` | — | **External**: an already-running OpenAI-compatible base URL (e.g. `http://127.0.0.1:11434/v1`) |
+| `models[].publicPort` | `publicBase + i` | Port clients connect to (owned by the supervisor) |
+| `models[].internalPort` | next free ≥ `internalBase` | Port llama-server listens on (managed entries only) |
+| `models[].alias` | `key` (or `--alias`) | Model id reported by `/v1/models` |
+| `models[].ctxSize` | `defaults.ctxSize` | Context window for managed entries |
+| `models[].cacheTypeK` / `cacheTypeV` | `defaults.*` | KV cache quantisation |
+| `models[].mtp` | off | Add `--spec-type draft-mtp` (only pays off if the model has a NextN head) |
+| `models[].softContextLimit` | `ctxSize × softContextRatio` | Fake context ceiling; `0` disables |
+| `models[].args` | auto-built | Advanced/legacy escape hatch: pass these to llama-server verbatim instead |
+| `ports.publicBase` / `ports.internalBase` | `8080` / `9080` | Automatic port allocation bases |
+| `defaults.*` | see example | Field defaults for managed entries |
+| `llamaServer.bin` / `.args` | — | How to launch llama-server (`common` is a legacy alias) |
 
 ### Control endpoints (on every public port)
 
@@ -248,6 +297,7 @@ Test machine: RTX 4070 Ti 12 GB · Ryzen 5 9600X · 31 GB RAM · Windows · llam
 │   ├─ stop-supervisor.ps1      stop the supervisor
 │   ├─ supervisor-status.ps1    status
 │   ├─ unload-local-models.ps1  release everything now
+│   ├─ export-dsh-routes.ps1   generate the DSH `providers:` block from models.json
 │   ├─ install-autostart.ps1    start at logon (scheduled task; unnecessary once the plugin is used)
 │   └─ uninstall-autostart.ps1  remove it
 └─ LICENSE
