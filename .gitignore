@@ -1,0 +1,17 @@
+# build / runtime artefacts
+logs/
+*.log
+node_modules/
+
+# model weights are never committed — they are huge and downloaded separately
+models/
+*.gguf
+*.safetensors
+*.bin
+
+# local machine state
+models.json
+.effective/
+supervisor.effective.json
+run-*.cmd
+*.tmp

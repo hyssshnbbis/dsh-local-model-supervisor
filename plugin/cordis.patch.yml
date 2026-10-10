@@ -1,0 +1,40 @@
+# ============================================================================
+# dsh-local-model-supervisor —— DSH bundle patch
+# ============================================================================
+# Mount declaration for the plugin. DSH composes the config tree as a stack of
+# bundle patches; this file inserts the plugin entry into the profile.
+#
+# Install:
+#   dsh plugin --profile <profile> add link:<path to this repo>/plugin
+#
+# Or by hand: merge the `insert` block below into your profile's cordis.patch.yml,
+# and make the paths point at YOUR checkout.
+# ============================================================================
+
+- insert:
+    - id: dsh-local-model-supervisor
+      name: dsh-local-model-supervisor
+      config:
+        # REQUIRED — absolute path to supervisor/supervisor.js in this repository.
+        # Example: 'D:\dsh-local-model-supervisor\supervisor\supervisor.js'
+        supervisorScript: ''
+
+        # Optional — defaults to <supervisor dir>/models.json
+        # Example: 'D:\dsh-local-model-supervisor\supervisor\models.json'
+        supervisorConfig: ''
+
+        # Optional — where the plugin writes its own log
+        # logFile: 'D:\dsh-local-model-supervisor\logs\supervisor.plugin.log'
+
+        # The ports your DSH local routes already point at.
+        publicPorts: [8080]
+
+        # Start the supervisor together with DSH.
+        autoStart: true
+
+        # Release loaded models when DSH exits (VRAM comes back immediately).
+        unloadOnExit: true
+
+        # Also stop the supervisor process itself when DSH exits.
+        # false = keep it around, the next DSH start reuses it.
+        stopOnExit: false

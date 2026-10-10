@@ -1,0 +1,25 @@
+{
+  "name": "dsh-local-model-supervisor",
+  "version": "1.0.0",
+  "description": "DSH plugin: cold-start a local llama.cpp model on demand and release RAM/VRAM after an idle timeout",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "llama.cpp",
+    "local-model",
+    "gguf"
+  ],
+  "type": "module",
+  "main": "lib/index.js",
+  "files": [
+    "lib",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "license": "MIT"
+}
