@@ -45,6 +45,8 @@ has to change at all**, and curl / Python / any other client gets the same behav
 
 | Feature | Description |
 |---|---|
+| **Only inference routes wake a model** | A stray request to the port must not load a multi-GB model — and, with a single GPU slot, must not kill whatever is serving. Non-inference paths get a plain 404 (with the caller's User-Agent logged) while nothing is loaded. Added after a client polling `GET /wyvrn/Synapse` swapped the resident model 24 times and cut off live generations. |
+| **Never kills a live generation** | Switching models checks whether the resident model still has active requests; if it is mid-stream the switch is refused with a 503 explaining why, instead of cutting the stream off. |
 | **Cheap while idle** | The resident supervisor is one Node process and measures ~2–4 MB above a bare `node.exe` on the same machine (bare node 36.9 MB, supervisor ~38–41 MB RSS; JS heap ~6 MB). It holds **no VRAM at all** until a request arrives. `node supervisor.js` also reports its own breakdown at `GET /__supervisor/status` → `memory`. |
 | **One unified model list** | Declare any number of local models in a single list. Give a **`path`** and the supervisor manages the process; give a **`url`** and it just forwards to a server you already run (Ollama, LM Studio, vLLM, …). Two fields per entry is enough. |
 | **Ports allocated automatically** | The *i*-th model takes `publicBase + i`; managed models take the next free port at or above `internalBase`, skipping anything claimed. Collisions are rejected at startup, never at spawn time. |

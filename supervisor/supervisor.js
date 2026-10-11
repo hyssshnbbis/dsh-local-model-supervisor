@@ -226,6 +226,7 @@ for (const m of cfg.models) {
   m.active = 0;           // requests currently being proxied
   m.lastError = null;
   m.softGraceUntil = 0;   // while in the future, the ceiling is not enforced
+  m.stoppedIntentionally = 0;   // timestamp of the last deliberate stop (see proxyBufferedWithRetry)
   // The real window, taken from the launch args so it can never drift from what llama-server
   // was actually started with.
   m.realContextLimit = m.external ? 0 : parseCtxSize(m);
@@ -327,6 +328,9 @@ async function stopModel(m, reason) {
     await sleep(300);
   }
   m.proc = null;
+  // Remember that this was deliberate, so the retry path below does not immediately fight the
+  // switch by starting this model again.
+  m.stoppedIntentionally = Date.now();
   // Sockets to the process we just killed are useless now — a reused one would talk to a dead
   // server and surface as a spurious ECONNRESET.
   try { UPSTREAM_AGENT.destroy() } catch { }
@@ -343,12 +347,19 @@ async function startModel(m) {
   if (m.external) return;                      // it is already running somewhere else
   if (isRunning(m) && (await probeHealth(m))) return;
 
-  // single GPU slot: a second 27B model cannot coexist on this card
+  // Single GPU slot: another managed model has to give up the card first. But NEVER kill one that
+  // is mid-request — that aborts a live generation and the client sees a broken stream
+  // ("Stream ended without finish_reason"). Refuse instead and let the caller retry once the other
+  // model is idle. This was a real incident: a stray request for the other model killed a
+  // generation that was already streaming.
   for (const other of cfg.models) {
-    if (other !== m && isRunning(other)) {
-      log(`[${m.key}] needs the GPU; stopping [${other.key}] first`);
-      await stopModel(other, 'switched to ' + m.key);
+    if (other === m || other.external || !isRunning(other)) continue;
+    if (other.active > 0) {
+      throw new Error(`[${other.key}] is serving ${other.active} request(s) and holds the GPU; `
+        + `refusing to kill a live generation to start [${m.key}]`);
     }
+    log(`[${m.key}] needs the GPU; stopping [${other.key}] first`);
+    await stopModel(other, 'switched to ' + m.key);
   }
 
   if (m.starting) { await m.starting; return; }
@@ -400,6 +411,7 @@ async function startModel(m) {
         if (SETTLE_MS > 0) await sleep(SETTLE_MS);
         if (!isRunning(m)) throw new Error('llama-server died during warm-up');
         log(`[${m.key}] ready on internal port ${m.internalPort} (ctx ${m.realContextLimit || '?'}, soft ceiling ${m.softContextLimit || 'off'})`);
+        m.stoppedIntentionally = 0;
         return;
       }
       await sleep(1000);
@@ -450,6 +462,26 @@ function proxyTo(m, req, res) {
   res.on('close', () => { if (!res.writableEnded) upstream.destroy(); });
   req.pipe(upstream);
 }
+
+/* ------------------------------------------ which requests may wake a model */
+
+// ONLY these paths may start a model. Everything else must not: a stray request to the port used
+// to load a multi-GB model AND — because only one model fits on the card — kill whatever model was
+// serving at that moment. That is not hypothetical: a client polling `GET /wyvrn/Synapse` (24
+// times, alternating between both public ports) repeatedly swapped the resident model and cut off
+// live generations mid-stream.
+const INFERENCE_PATHS = new Set([
+  '/v1/chat/completions',
+  '/v1/completions',
+  '/v1/responses',
+  '/v1/embeddings',
+  '/completion',
+  '/chat/completions',
+  '/embeddings',
+  '/embedding',
+  '/reranking',
+  '/infill',
+]);
 
 /* ------------------------------------------ soft context ceiling (fake overflow) */
 
@@ -557,7 +589,7 @@ async function proxyBufferedWithRetry(m, req, res, body, retriesLeft = 1) {
 
   if (res.headersSent) { res.end(); return; }
 
-  if (retriesLeft > 0 && !res.writableEnded) {
+  if (retriesLeft > 0 && !res.writableEnded && Date.now() - m.stoppedIntentionally > 10000) {
     log(`[${m.key}] retrying the request once (the server may have died on a cold first request)`);
     try { await startModel(m); } catch (err) { log(`[${m.key}] restart before retry failed: ${err.message}`); }
     if (!res.writableEnded) return proxyBufferedWithRetry(m, req, res, body, retriesLeft - 1);
@@ -684,6 +716,24 @@ for (const m of cfg.models) {
 
     // Metadata while unloaded -> answer locally, do NOT touch the GPU.
     if (isMetadata && !isRunning(m)) { syntheticMetadata(m, req, res); return; }
+
+    // A non-inference route must never wake a model, and above all must never trigger the
+    // single-GPU-slot switch (waking one model kills whichever one is serving). If the model
+    // happens to be up we still forward it; otherwise say plainly that this is not an
+    // inference port. A guard against exactly the polling client described above.
+    if (!isMetadata && !INFERENCE_PATHS.has(url) && !isRunning(m)) {
+      const ua = req.headers['user-agent'] || '';
+      log(`[${m.key}] ${req.method} ${url} is not an inference route -> 404 without waking anything (ua="${ua}")`);
+      res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({
+        error: {
+          message: `supervisor: ${url} is not an inference route, so ${m.key} was left unloaded. `
+            + `Inference paths are: ${[...INFERENCE_PATHS].join(', ')}`,
+          type: 'supervisor_unknown_route',
+        },
+      }));
+      return;
+    }
 
     try {
       if (!isRunning(m)) log(`[${m.key}] request ${req.method} ${url} -> waking model`);
