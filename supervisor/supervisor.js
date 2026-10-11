@@ -502,15 +502,19 @@ function countInputTokens(m, bodyBuf) {
 // with /exceeds the available context size/i (its OVERFLOW_PATTERNS entry is literally commented
 // "llama.cpp server") and classifies it as CONTEXT_WINDOW_EXCEEDED, which is what triggers
 // dsh-compaction-basic's overflow recovery.
-function syntheticOverflow(m, res, n) {
+//
+// `limit` is what gets reported as n_ctx: the soft ceiling normally, or the real window when the
+// request is past even that. Either wording classifies identically, so the guard stays active at
+// every size.
+function syntheticOverflow(m, res, n, limit = m.softContextLimit) {
   res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify({
     error: {
       code: 400,
-      message: `request (${n} tokens) exceeds the available context size (${m.softContextLimit} tokens), try increasing it`,
+      message: `request (${n} tokens) exceeds the available context size (${limit} tokens), try increasing it`,
       type: 'exceed_context_size_error',
       n_prompt_tokens: n,
-      n_ctx: m.softContextLimit,
+      n_ctx: limit,
     },
   }));
 }
@@ -709,21 +713,24 @@ for (const m of cfg.models) {
       if (body !== null) {
         const n = await countInputTokens(m, body);
         if (n !== null && n > m.softContextLimit) {
-          const real = m.realContextLimit;
-          // Above the real window too: let llama-server answer authentically, it says the same thing.
-          if (real > 0 && n > real) {
-            log(`[${m.key}] ${n} tokens exceeds the real window ${real}; forwarding for the authentic error`);
-            return proxyBufferedWithRetry(m, req, res, body);
-          }
           // Inside the grace window this is most likely DSH's compaction replay: let it through,
           // otherwise compaction could never complete and the session would be stuck.
           if (Date.now() < m.softGraceUntil) {
             log(`[${m.key}] GRACE: allowing ${n} tokens past the ${m.softContextLimit} ceiling (compaction replay)`);
             return proxyBufferedWithRetry(m, req, res, body);
           }
-          log(`[${m.key}] SOFT LIMIT HIT: ${n} prompt tokens > ${m.softContextLimit} (real window ${real || '?'} still has room) -> synthetic exceed_context_size_error`);
+          // The ceiling applies at EVERY size, including above the real window. An earlier version
+          // forwarded those "so llama-server can report the authentic error" — which silently
+          // switched the guard off exactly when it mattered most: a session could sail past the real
+          // window and then grow without bound, until nobody could compact it any more. Report the
+          // real window in the message when we are past it, but still answer it here.
+          const real = m.realContextLimit;
+          const reported = (real > 0 && n > real) ? real : m.softContextLimit;
+          log(`[${m.key}] SOFT LIMIT HIT: ${n} prompt tokens > ceiling ${m.softContextLimit}` +
+              (reported !== m.softContextLimit ? ` (and past the real window ${real})` : '') +
+              ` -> synthetic exceed_context_size_error (${reported})`);
           m.softGraceUntil = Date.now() + SOFT_GRACE_MS;
-          return syntheticOverflow(m, res, n);
+          return syntheticOverflow(m, res, n, reported);
         }
         if (n !== null) {
           m.softGraceUntil = 0;   // a request that fits means the reduction worked

@@ -257,6 +257,29 @@ Three things make this work:
 > The fake ceiling must stay **above** DSH's own proactive-compaction trigger, or it would also
 > block the summarization replay.
 
+#### What it does not fix, and a hole worth recording
+
+The ceiling *forces* compaction; it cannot make compaction **succeed**. If a single step pushes the
+conversation so far past the window that even the compaction replay (system prompt + the masked
+region) is larger than the real window, the summarization request is rejected too and nothing can
+recover that session any more. Two ways out: start a new session, or point
+`summarizationProvider` / `summarizationModel` at a model with a bigger window so the replay has
+somewhere to run.
+
+An earlier version of this guard had a hole that is worth spelling out, because it cost a real
+session:
+
+> Requests **above the real window** were forwarded "so llama-server can report the authentic
+> error". That quietly switched the guard off exactly when it mattered most. Up to the real window
+> the ceiling fired and compaction ran; past it, requests went straight through, so a session could
+> sail beyond the window and then grow without bound. Observed in the log: the ceiling fired once
+> at 26 012 tokens, the session then reached **137 052** tokens, and every subsequent compaction
+> replay (~75 000 tokens) was rejected by llama-server's own limit — unrecoverable.
+
+The ceiling now applies at **every size**; only the `n_ctx` reported in the error changes (the soft
+ceiling normally, the real window once you are past it). Both wordings classify as
+`CONTEXT_WINDOW_EXCEEDED`, so the guard never turns itself off.
+
 ## 6. Measured results
 
 Test machine: RTX 4070 Ti 12 GB · Ryzen 5 9600X · 31 GB RAM · Windows · llama.cpp CUDA build.
