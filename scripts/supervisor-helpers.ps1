@@ -82,3 +82,44 @@ function Get-SupervisorProcess {
         }
     )
 }
+
+<#
+  Resolve-NodeExe - find a real node.exe, preferring one that is not a version-manager shim.
+
+  `node` on PATH is often a shim: nvm-windows puts a junction to its .shim directory there, and
+  that shim is an EXTRA process which re-executes the real interpreter. For a supervisor whose
+  entire job is to sit idle, paying an extra process plus ~6 MB of resident memory buys nothing.
+
+  Order: $env:DSH_LOCAL_MODEL_NODE, extra candidates, the Node runtime DSH ships with, PATH
+  entries that are not shims, and finally whatever `node` resolves to.
+#>
+function Resolve-NodeExe {
+    param([string[]]$ExtraCandidates = @())
+
+    $candidates = [System.Collections.Generic.List[string]]::new()
+    if ($env:DSH_LOCAL_MODEL_NODE) { $candidates.Add($env:DSH_LOCAL_MODEL_NODE) }
+    foreach ($c in $ExtraCandidates) { if ($c) { $candidates.Add($c) } }
+
+    # DSH ships its own Node runtime; it is a real binary and is present on any DSH machine.
+    $rt = Join-Path $HOME '.dsh\dsh-runtimes'
+    if (Test-Path -LiteralPath $rt) {
+        Get-ChildItem -LiteralPath $rt -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $candidates.Add((Join-Path $_.FullName 'dependencies\node\bin\node.exe'))
+        }
+    }
+
+    foreach ($dir in ($env:PATH -split ';')) {
+        if (-not $dir) { continue }
+        $d = $dir.Trim('"').TrimEnd('\')
+        if ($d -like '*\.shim' -or $d -like '*nvm\.nodejs*') { continue }
+        $candidates.Add((Join-Path $d 'node.exe'))
+    }
+
+    foreach ($c in $candidates) {
+        if ($c -and (Test-Path -LiteralPath $c)) { return (Resolve-Path -LiteralPath $c).Path }
+    }
+
+    $cmd = Get-Command node -ErrorAction SilentlyContinue
+    if ($cmd) { return $cmd.Source }
+    return $null
+}

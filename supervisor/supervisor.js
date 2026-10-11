@@ -60,12 +60,31 @@ const LOG_DIR = path.join(__dirname, '..', 'logs');
 const LOG_FILE = path.join(LOG_DIR, 'supervisor.log');
 fs.mkdirSync(LOG_DIR, { recursive: true });
 
+// One persistent handle with buffered writes, instead of fs.appendFileSync per line. llama.cpp is
+// chatty, so the old version opened/wrote/closed the file thousands of times — file-handle churn
+// plus a steady stream of temporary strings. Nothing is duplicated to stdout either: the launcher
+// already redirects stdout into a file, so console.log wrote every single line TWICE.
+const LOG_STREAM = fs.createWriteStream(LOG_FILE, { flags: 'a' });
+
 function log(msg) {
-  const line = `${new Date().toISOString()} ${msg}`;
-  console.log(line);
-  try { fs.appendFileSync(LOG_FILE, line + '\n'); } catch { /* logging must never crash us */ }
+  try { LOG_STREAM.write(`${new Date().toISOString()} ${msg}\n`) } catch { /* logging must never crash us */ }
 }
 
+/** The few lines that should also land in the launcher's stdout log. */
+function logConsole(msg) {
+  try { process.stdout.write(`${new Date().toISOString()} ${msg}\n`) } catch { }
+  log(msg);
+}
+
+// llama.cpp's routine output (load tensors, slot timings, graph reuse) is dropped by default:
+// it dominated the log file and this process's allocation churn for no operational value.
+// Warnings, errors and a few meaningful phrases are kept. Use --child-log for everything.
+const CHILD_LOG_ALL = process.argv.includes('--child-log') || process.env.SUPERVISOR_CHILD_LOG === '1';
+
+// Bounded keep-alive pool for upstream sockets. Node's global agent keeps sockets alive after
+// each request; without a cap, a burst of requests leaves a pile of open sockets behind, which is
+// where the supervisor's ~280 handles came from.
+const UPSTREAM_AGENT = new http.Agent({ keepAlive: true, maxSockets: 8, maxFreeSockets: 2, timeout: 30000 });
 /* --------------------------------------------------- model list normalization */
 
 // ONE unified list accepts both kinds of local model source:
@@ -252,7 +271,7 @@ function upstreamFor(m, reqPath) {
 function probeHealth(m, timeoutMs = 3000) {
   return new Promise((resolve) => {
     const req = http.request(
-      { host: '127.0.0.1', port: m.internalPort, path: '/health', method: 'GET', timeout: timeoutMs },
+      { host: '127.0.0.1', port: m.internalPort, path: '/health', method: 'GET', timeout: timeoutMs, agent: false },
       (res) => {
         let body = '';
         res.on('data', (c) => (body += c));
@@ -308,6 +327,9 @@ async function stopModel(m, reason) {
     await sleep(300);
   }
   m.proc = null;
+  // Sockets to the process we just killed are useless now — a reused one would talk to a dead
+  // server and surface as a spurious ECONNRESET.
+  try { UPSTREAM_AGENT.destroy() } catch { }
   // wait until the port stops answering, so the next start cannot race the old socket
   const portDeadline = Date.now() + 5000;
   while (Date.now() < portDeadline) {
@@ -349,10 +371,17 @@ async function startModel(m) {
     const toLog = (buf) => {
       const text = buf.toString();
       for (const line of text.split(/\r?\n/)) {
-        if (!line.trim()) continue;
-        // llama.cpp is very chatty at -lv 4; keep the supervisor log readable
-        if (/^\d+\.\d+\.\d+\.\d+ [IWD] (load_tensors|llama_context|llama_kv_cache|sched_reserve|common_init|init:)/.test(line)) continue;
-        log(`[${m.key}] ${line.trim()}`);
+        const t = line.trim();
+        if (!t) continue;
+        if (!CHILD_LOG_ALL) {
+          // Keep warnings/errors and a few meaningful phrases, drop the routine noise
+          // (load tensors, slot timings, graph reuse) that llama.cpp emits constantly —
+          // it dominated both the log file and this process's allocation churn.
+          const interesting = /^\d+(?:\.\d+)* [WE] /.test(t)
+            || /exceed|out of memory|CUDA error|assert|abort|failed|panick/i.test(t);
+          if (!interesting) continue;
+        }
+        log(`[${m.key}] ${t}`);
       }
     };
     proc.stdout.on('data', toLog);
@@ -399,7 +428,7 @@ function proxyTo(m, req, res) {
   headers.host = target.hostHeader;
 
   const upstream = http.request(
-    { host: target.host, port: target.port, method: req.method, path: target.path, headers },
+    { host: target.host, port: target.port, method: req.method, path: target.path, headers, agent: UPSTREAM_AGENT },
     (up) => {
       res.writeHead(up.statusCode || 502, up.headers);
       up.pipe(res);                       // stream through: SSE works untouched
@@ -426,7 +455,7 @@ function proxyTo(m, req, res) {
 
 // Paths whose prompt size we police using llama.cpp's token-counting endpoint.
 const COUNTED_PATHS = new Set(['/v1/chat/completions', '/v1/responses']);
-const MAX_BODY_BYTES = 64 * 1024 * 1024;
+const MAX_BODY_BYTES = 16 * 1024 * 1024;
 
 function readBody(req) {
   return new Promise((resolve, reject) => {
@@ -449,7 +478,7 @@ function countInputTokens(m, bodyBuf) {
   return new Promise((resolve) => {
     const target = upstreamFor(m, '/v1/chat/completions/input_tokens');
     const req = http.request({
-      host: target.host, port: target.port, path: target.path,
+      host: target.host, port: target.port, path: target.path, agent: UPSTREAM_AGENT,
       method: 'POST',
       headers: { 'content-type': 'application/json', 'content-length': bodyBuf.length },
       timeout: 30000,
@@ -497,7 +526,7 @@ function sendBuffered(m, req, res, body) {
     headers['content-length'] = body.length;
 
     const upstream = http.request(
-      { host: target.host, port: target.port, method: req.method, path: target.path, headers },
+      { host: target.host, port: target.port, method: req.method, path: target.path, headers, agent: UPSTREAM_AGENT },
       (up) => {
         res.writeHead(up.statusCode || 502, up.headers);
         up.pipe(res);
@@ -575,10 +604,21 @@ function syntheticMetadata(m, req, res) {
 
 function statusPayload() {
   const now = Date.now();
+  const mu = process.memoryUsage();
+  const mb = (n) => +(n / 1048576).toFixed(1);
   return {
     object: 'supervisor.status',
     pid: process.pid,
     idleTimeoutSec: cfg.idleTimeoutSec ?? 500,
+    // Resident-memory breakdown. Handy for spotting a leak, and it is what makes "the supervisor
+    // is cheap" a measurement rather than a claim.
+    memory: {
+      rssMiB: mb(mu.rss),
+      heapUsedMiB: mb(mu.heapUsed),
+      heapTotalMiB: mb(mu.heapTotal),
+      externalMiB: mb(mu.external),
+      arrayBuffersMiB: mb(mu.arrayBuffers),
+    },
     models: cfg.models.map((m) => ({
       key: m.key,
       label: m.label,
@@ -697,7 +737,7 @@ for (const m of cfg.models) {
   });
 
   server.on('error', (err) => {
-    log(`[${m.key}] FATAL: cannot listen on ${m.publicPort}: ${err.message}`);
+    logConsole(`[${m.key}] FATAL: cannot listen on ${m.publicPort}: ${err.message}`);
     process.exit(1);
   });
 
@@ -729,9 +769,10 @@ let shuttingDown = false;
 async function shutdown(signal) {
   if (shuttingDown) return;
   shuttingDown = true;
-  log(`received ${signal}; stopping managed models`);
+  logConsole(`received ${signal}; stopping managed models`);
   await unloadAll('supervisor shutdown');
-  log('supervisor exiting');
+  logConsole('supervisor exiting');
+  try { LOG_STREAM.end() } catch { }
   process.exit(0);
 }
 process.on('SIGINT', () => shutdown('SIGINT'));
@@ -743,5 +784,5 @@ process.on('exit', () => {
   }
 });
 
-log(`supervisor started (pid ${process.pid}) - idleTimeout=${IDLE_MS / 1000}s check=${CHECK_MS / 1000}s`);
-log(`config: ${CONFIG_PATH}`);
+logConsole(`supervisor started (pid ${process.pid}) - idleTimeout=${IDLE_MS / 1000}s check=${CHECK_MS / 1000}s`);
+logConsole(`config: ${CONFIG_PATH}`);

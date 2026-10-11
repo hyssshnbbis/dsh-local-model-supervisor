@@ -46,6 +46,7 @@ DSH 的本地路由走 `@deepseek-ai/dsh-llm-pi-ai`,配置里只有 `api: openai
 
 | 功能 | 说明 |
 |---|---|
+| **常驻开销极小** | 常驻的管家只有一个 Node 进程,比同机上的裸 `node.exe` **只多约 2~4 MB**(实测:裸 node 36.9 MB,管家 ~38~41 MB RSS;JS 堆约 6 MB)。而且**在请求到来之前完全不占显存**。它自己的内存明细就在 `GET /__supervisor/status` 的 `memory` 字段里 |
 | **一份统一清单** | 任意多个本地模型写在一个列表里。给 **`path`** 就由管家托管进程;给 **`url`** 就只转发到你已经在跑的服务(Ollama / LM Studio / vLLM…)。每项两个字段就够 |
 | **端口自动分配** | 第 *i* 个模型占 `publicBase + i`;托管模型从 `internalBase` 往上取第一个空闲端口,已占用的自动跳过。冲突在**启动时**就报错,不会拖到拉起进程才失败 |
 | **路由自动生成** | `scripts/export-dsh-routes.ps1` 把清单变成可直接粘贴的 DSH `providers:` 块,导入模型不用手写 YAML |
@@ -314,7 +315,35 @@ dsh plugin --profile desktop add link:<本仓库>/plugin
 └─ LICENSE
 ```
 
-## 9. DSH 插件的实现要点
+## 9. 常驻开销是怎么压下来的
+
+管家存在的意义就是"闲着待命",所以它自身的开销值得较真:
+
+- **它解析出真正的 `node.exe`,不用版本管理器垫片。** PATH 上的 `node` 常常是垫片
+  (nvm-windows 会把一个指向自己 `.shim` 目录的 junction 放进去),垫片会再启动一次真正的解释器
+  —— 白多一个进程 + 约 6 MB。`scripts/supervisor-helpers.ps1` 里的 `Resolve-NodeExe` 依次优先:
+  `$env:DSH_LOCAL_MODEL_NODE` → DSH 自带的 Node 运行时 → PATH 里非垫片的项。可用环境变量覆盖。
+- **V8 堆加上限**(`--max-old-space-size=64`,可用 `-MaxOldSpaceMb` 调整)。在裸 `node.exe` 上实测:
+  36.9 MB → 33.9 MB。**具体数值几乎不影响**(64/48/32/16 测出来一样),关键是"有上限"。
+- **日志只写一次,且走一个带缓冲的句柄。** 原来是每行 `fs.appendFileSync` **外加** `console.log`,
+  而启动器又把 stdout 重定向到文件 —— 等于**每行写两遍**。
+- **默认丢弃 llama.cpp 的例行输出**(load tensors、slot timing、graph reuse),只保留警告/错误和少数
+  关键短语;需要全量时加 `--child-log`。
+- **上游套接字池化并限流**(`maxSockets: 8` / `maxFreeSockets: 2`),不再依赖 Node 的全局 agent;
+  且停掉模型时会销毁连接池,避免重启后的服务收到陈旧套接字。
+
+本机实测(Windows / Node 24):
+
+| | 进程数 | 常驻 |
+|---|---|---|
+| 优化前 | 2(垫片 + 管家) | 50.1 MB |
+| 优化后 | 1 | ~38~41 MB |
+
+这已经和**一个空的 `node.exe`** 只差几 MB,基本没有可榨的了 —— 剩下的是 Node 自身
+http / fs / child_process 的基线。`--jitless`、`--optimize-for-size`、`--max-semi-space-size`
+都实测过,结果**更差或持平**,所以一个都没采用。
+
+## 10. DSH 插件的实现要点
 
 **用 DSH 自己的 Electron 二进制当 node 用。** DSH 跑在 Electron 里,`process.execPath` 是应用本体
 而不是 node。插件用 `ELECTRON_RUN_AS_NODE=1` 把它当纯 Node 进程来启动管家,所以**机器上不需要

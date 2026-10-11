@@ -40,6 +40,10 @@ if (-not $status) {
 Write-Host '=============== local model supervisor ===============' -ForegroundColor Cyan
 Write-Host (" supervisor pid : {0}   (status read from port {1})" -f $status.pid, $viaPort)
 Write-Host (" idle timeout   : {0}s without inference -> released" -f $status.idleTimeoutSec)
+if ($status.memory) {
+    Write-Host (" resident memory: {0} MiB rss  ·  js heap {1} MiB  ·  external {2} MiB" -f `
+        $status.memory.rssMiB, $status.memory.heapUsedMiB, $status.memory.externalMiB)
+}
 Write-Host ''
 $status.models | ForEach-Object {
     $state = if ($_.starting) { 'STARTING' } elseif ($_.running) { 'LOADED' } else { 'unloaded' }

@@ -41,6 +41,7 @@ const DEFAULTS = {
   unloadOnExit: true,
   stopOnExit: false,
   startTimeoutMs: 60000,
+  maxOldSpaceMb: 64,             // V8 heap cap for the supervisor process we spawn
 }
 
 /* ------------------------------------------------------------------ helpers */
@@ -172,7 +173,9 @@ export default {
         return null
       }
 
-      const args = [cfg.supervisorScript]
+      // Cap the V8 heap: the supervisor holds no large data structures, and letting it grow to
+      // the default ceiling only inflates resident memory for a process whose job is to idle.
+      const args = [`--max-old-space-size=${cfg.maxOldSpaceMb ?? 64}`, cfg.supervisorScript]
       if (cfg.supervisorConfig) args.push(cfg.supervisorConfig)
 
       // DSH runs inside Electron, so process.execPath is the app binary, not node. Running it

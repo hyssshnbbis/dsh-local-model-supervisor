@@ -45,6 +45,7 @@ has to change at all**, and curl / Python / any other client gets the same behav
 
 | Feature | Description |
 |---|---|
+| **Cheap while idle** | The resident supervisor is one Node process and measures ~2–4 MB above a bare `node.exe` on the same machine (bare node 36.9 MB, supervisor ~38–41 MB RSS; JS heap ~6 MB). It holds **no VRAM at all** until a request arrives. `node supervisor.js` also reports its own breakdown at `GET /__supervisor/status` → `memory`. |
 | **One unified model list** | Declare any number of local models in a single list. Give a **`path`** and the supervisor manages the process; give a **`url`** and it just forwards to a server you already run (Ollama, LM Studio, vLLM, …). Two fields per entry is enough. |
 | **Ports allocated automatically** | The *i*-th model takes `publicBase + i`; managed models take the next free port at or above `internalBase`, skipping anything claimed. Collisions are rejected at startup, never at spawn time. |
 | **Routes generated for you** | `scripts/export-dsh-routes.ps1` turns the list into a ready-to-paste DSH `providers:` block, so importing a model does not mean hand-writing YAML. |
@@ -336,7 +337,39 @@ one card, so this only helps when the models really do fit together.
 └─ LICENSE
 ```
 
-## 9. DSH plugin implementation notes
+## 9. Keeping the resident footprint small
+
+The supervisor exists to sit idle, so its own cost matters:
+
+- **It resolves a real `node.exe`, not a version-manager shim.** `node` on PATH is often a shim
+  (nvm-windows puts a junction to its `.shim` directory there) which re-executes the real
+  interpreter — an extra process plus ~6 MB for nothing. `Resolve-NodeExe` in
+  `scripts/supervisor-helpers.ps1` prefers `$env:DSH_LOCAL_MODEL_NODE`, then the Node runtime DSH
+  ships with, then non-shim PATH entries. Override with `DSH_LOCAL_MODEL_NODE`.
+- **The V8 heap is capped** (`--max-old-space-size=64`, adjustable with `-MaxOldSpaceMb`). Measured
+  on a bare `node.exe`: 36.9 MB → 33.9 MB. The specific value barely matters (64/48/32/16 all
+  measure the same); having *a* cap does.
+- **The log is written once, through one buffered handle.** It used to be
+  `fs.appendFileSync` per line *and* `console.log` — and the launcher redirects stdout to a file,
+  so every line was written twice.
+- **llama.cpp's routine output is dropped by default** (load tensors, slot timings, graph reuse).
+  Warnings, errors and a few meaningful phrases are kept. Run with `--child-log` for everything.
+- **Upstream sockets are pooled and capped** (`maxSockets: 8`, `maxFreeSockets: 2`) instead of
+  relying on Node's global agent, and the pool is destroyed when a model is stopped so a restarted
+  server can never receive a stale socket.
+
+Measured on the development machine (Windows, Node 24):
+
+| | Processes | Resident |
+|---|---|---|
+| Before | 2 (shim + supervisor) | 50.1 MB |
+| After | 1 | ~38–41 MB |
+
+That is within a few MB of an empty `node.exe`, so there is little left to win: the remaining
+footprint is Node's own HTTP/fs/child_process baseline. `--jitless`, `--optimize-for-size` and
+`--max-semi-space-size` were all measured and made things **worse** or equal, so none are used.
+
+## 10. DSH plugin implementation notes
 
 **It runs DSH's own Electron binary as Node.** DSH runs inside Electron, so `process.execPath` is
 the application binary, not node. The plugin starts the supervisor with
