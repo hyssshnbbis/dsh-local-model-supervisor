@@ -18,7 +18,8 @@ param(
     [string]$Config = '',
     [int[]]$Ports = @(),
     [switch]$WhatIf,
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Continue'
@@ -26,6 +27,25 @@ $ErrorActionPreference = 'Continue'
 # Ports come from the supervisor config so any number of models / any publicBase works.
 . (Join-Path $PSScriptRoot 'supervisor-helpers.ps1')
 if (-not $Ports -or $Ports.Count -eq 0) { $Ports = Get-LocalModelPorts -Config $Config }
+
+# Refuse to cut a live generation off (see stop-supervisor.ps1). The supervisor enforces this too
+# and answers 409; checking here just gives a friendlier message.
+if (-not $Force -and -not $WhatIf) {
+    foreach ($port in $Ports) {
+        try {
+            $st = Invoke-RestMethod "http://127.0.0.1:$port/__supervisor/status" -TimeoutSec 5
+            $busy = @($st.models | Where-Object { $_.activeRequests -gt 0 })
+            if ($busy.Count -gt 0) {
+                foreach ($b in $busy) {
+                    Write-Host ("REFUSING TO UNLOAD: [{0}] is serving {1} request(s); that would cut the stream off." -f $b.key, $b.activeRequests) -ForegroundColor Red
+                }
+                Write-Host 'Wait for it to finish, or re-run with -Force.' -ForegroundColor Yellow
+                exit 2
+            }
+            break
+        } catch { }
+    }
+}
 
 function Get-GpuFreeMiB {
     $v = (nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>$null | Select-Object -First 1)
@@ -56,10 +76,11 @@ if ($WhatIf) {
 }
 
 $stoppedViaSupervisor = $false
+$unloadUrl = '/__supervisor/unload' + $(if ($Force) { '?force=1' } else { '' })
 if ($sup) {
     foreach ($port in $Ports) {
         try {
-            $r = Invoke-RestMethod "http://127.0.0.1:$port/__supervisor/unload" -Method Post -TimeoutSec 60
+            $r = Invoke-RestMethod "http://127.0.0.1:$port$unloadUrl" -Method Post -TimeoutSec 60
             $stoppedViaSupervisor = $true
             if (-not $Quiet) { Write-Host (" asked the supervisor on port {0} to unload" -f $port) -ForegroundColor Green }
             break

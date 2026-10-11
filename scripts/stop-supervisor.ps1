@@ -9,7 +9,8 @@
 param(
     [string]$Config = '',
     [int[]]$Ports = @(),
-    [switch]$Quiet
+    [switch]$Quiet,
+    [switch]$Force
 )
 
 $ErrorActionPreference = 'Continue'
@@ -18,6 +19,23 @@ $ErrorActionPreference = 'Continue'
 . (Join-Path $PSScriptRoot 'supervisor-helpers.ps1')
 if (-not $Ports -or $Ports.Count -eq 0) { $Ports = Get-LocalModelPorts -Config $Config }
 
+# Refuse to stop while a model is mid-request: stopping cuts the stream off and the client sees a
+# truncated answer ("Stream ended without finish_reason"). Check first, ask for -Force otherwise.
+$status = $null
+foreach ($port in $Ports) {
+    try { $status = Invoke-RestMethod "http://127.0.0.1:$port/__supervisor/status" -TimeoutSec 5; break } catch { }
+}
+if ($status -and -not $Force) {
+    $busy = @($status.models | Where-Object { $_.activeRequests -gt 0 })
+    if ($busy.Count -gt 0) {
+        foreach ($b in $busy) {
+            Write-Host ("REFUSING TO STOP: [{0}] is serving {1} request(s); stopping now would cut the stream off." -f $b.key, $b.activeRequests) -ForegroundColor Red
+        }
+        Write-Host 'Wait for it to finish, or re-run with -Force.' -ForegroundColor Yellow
+        exit 2
+    }
+}
+
 function Get-GpuFreeMiB {
     $v = (nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits 2>$null | Select-Object -First 1)
     if ($v -match '(\d+)') { return [int]$Matches[1] } else { return $null }
@@ -25,10 +43,12 @@ function Get-GpuFreeMiB {
 
 $before = Get-GpuFreeMiB
 
-# 1. ask the supervisor to unload its models gracefully (best effort)
+# 1. ask the supervisor to unload its models gracefully (best effort).
+#    -Force adds ?force=1, without which the supervisor returns 409 while a request is in flight.
+$unloadUrl = '/__supervisor/unload' + $(if ($Force) { '?force=1' } else { '' })
 foreach ($port in $Ports) {
     try {
-        Invoke-RestMethod "http://127.0.0.1:$port/__supervisor/unload" -Method Post -TimeoutSec 30 | Out-Null
+        Invoke-RestMethod "http://127.0.0.1:$port$unloadUrl" -Method Post -TimeoutSec 30 | Out-Null
         if (-not $Quiet) { Write-Host ("unloaded models via 127.0.0.1:{0}" -f $port) }
     } catch { }
 }

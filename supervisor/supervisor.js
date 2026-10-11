@@ -227,6 +227,7 @@ for (const m of cfg.models) {
   m.lastError = null;
   m.softGraceUntil = 0;   // while in the future, the ceiling is not enforced
   m.stoppedIntentionally = 0;   // timestamp of the last deliberate stop (see proxyBufferedWithRetry)
+  m.graceHoldLogged = false;    // so the "holding for the replay" line is logged once per window
   // The real window, taken from the launch args so it can never drift from what llama-server
   // was actually started with.
   m.realContextLimit = m.external ? 0 : parseCtxSize(m);
@@ -698,8 +699,27 @@ function handleSupervisorRoute(m, req, res) {
       res.end(JSON.stringify({ error: { message: 'POST required' } }));
       return true;
     }
+    // Identify the caller, and refuse to cut a live generation off. An unload kills the resident
+    // model, so doing it mid-stream truncates the answer the client is reading ("Stream ended
+    // without finish_reason"). Enforced HERE rather than in each caller, so scripts, the DSH
+    // plugin and anything else all get the same protection.
+    const busy = cfg.models.filter((x) => x.active > 0);
+    const force = /[?&]force=1/.test(req.url || '');
+    log(`unload requested by ${req.socket.remoteAddress}:${req.socket.remotePort} `
+      + `ua="${req.headers['user-agent'] || ''}"${busy.length ? ` — ${busy.map((x) => `${x.key}:${x.active}`).join(', ')} in flight` : ''}`);
+    if (busy.length > 0 && !force) {
+      res.writeHead(409, { 'content-type': 'application/json; charset=utf-8' });
+      return res.end(JSON.stringify({
+        error: {
+          message: 'refusing to unload: '
+            + busy.map((x) => `[${x.key}] is serving ${x.active} request(s)`).join('; ')
+            + '. Retry once it is idle, or POST /__supervisor/unload?force=1 to override.',
+          type: 'supervisor_busy',
+        },
+      }));
+    }
     res.writeHead(200, { 'content-type': 'application/json' });
-    unloadAll('explicit /__supervisor/unload')
+    unloadAll('explicit /__supervisor/unload' + (force ? ' (forced)' : ''))
       .then(() => res.end(JSON.stringify({ ok: true, status: statusPayload() })))
       .catch((e) => res.end(JSON.stringify({ ok: false, error: e.message })));
     return true;
@@ -813,6 +833,21 @@ setInterval(async () => {
   const now = Date.now();
   for (const m of cfg.models) {
     if (m.external || !isRunning(m) || m.active > 0 || m.starting) continue;
+
+    // A soft-ceiling rejection opens a grace window because a compaction replay is expected to
+    // arrive shortly. Releasing the model inside that window would just mean reloading the whole
+    // thing (9-14 s) to answer the replay, so hold it until the window closes. The hold is
+    // bounded by the window itself and is logged once, not every tick.
+    if (now < m.softGraceUntil) {
+      if (!m.graceHoldLogged) {
+        m.graceHoldLogged = true;
+        log(`[${m.key}] idle past ${IDLE_MS / 1000}s but inside the compaction grace window `
+          + `(${Math.ceil((m.softGraceUntil - now) / 1000)}s left) -> keeping the model loaded for the replay`);
+      }
+      continue;
+    }
+    m.graceHoldLogged = false;
+
     if (now - m.lastUsed >= IDLE_MS) {
       log(`[${m.key}] idle for ${Math.round((now - m.lastUsed) / 1000)}s (>= ${IDLE_MS / 1000}s) -> releasing VRAM`);
       await stopModel(m, 'idle timeout');
