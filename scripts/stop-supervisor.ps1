@@ -15,7 +15,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # Ports come from the supervisor config so any number of models / any publicBase works.
-. (Join-Path $PSScriptRoot 'supervisor-ports.ps1')
+. (Join-Path $PSScriptRoot 'supervisor-helpers.ps1')
 if (-not $Ports -or $Ports.Count -eq 0) { $Ports = Get-LocalModelPorts -Config $Config }
 
 function Get-GpuFreeMiB {
@@ -33,21 +33,19 @@ foreach ($port in $Ports) {
     } catch { }
 }
 
-# 2. stop the supervisor process
-$supProcs = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like '*supervisor.js*' }
+# 2. stop the supervisor process (matches on the command line, not the image name — the plugin
+#    starts it through the Electron binary, so it is NOT called node.exe)
+$supProcs = Get-SupervisorProcess
 if (-not $supProcs) {
     if (-not $Quiet) { Write-Host 'no supervisor process is running.' }
 } else {
     foreach ($p in $supProcs) {
-        if (-not $Quiet) { Write-Host ("stopping supervisor pid {0}" -f $p.ProcessId) }
+        if (-not $Quiet) { Write-Host ("stopping supervisor pid {0} ({1})" -f $p.ProcessId, $p.Name) }
         Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
     }
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 500
-        $still = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-                 Where-Object { $_.CommandLine -like '*supervisor.js*' }
-        if (-not $still) { break }
+        if (-not (Get-SupervisorProcess)) { break }
     }
 }
 

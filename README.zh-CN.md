@@ -308,7 +308,7 @@ dsh plugin --profile desktop add link:<本仓库>/plugin
 │   ├─ supervisor-status.ps1    状态
 │   ├─ unload-local-models.ps1  立刻释放
 │   ├─ export-dsh-routes.ps1   从 models.json 生成 DSH 的 `providers:` 配置块
-│   ├─ supervisor-ports.ps1    共享助手:从配置里读端口列表
+│   ├─ supervisor-helpers.ps1   共享助手:从配置读端口列表、查找管家进程
 │   ├─ install-autostart.ps1    登录自动启动（计划任务，装插件后可省）
 │   └─ uninstall-autostart.ps1  取消
 └─ LICENSE

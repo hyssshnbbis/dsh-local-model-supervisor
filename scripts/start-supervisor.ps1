@@ -27,6 +27,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'supervisor-helpers.ps1')
 $root    = Split-Path $PSScriptRoot -Parent
 if (-not $Config) { $Config = Join-Path $root 'supervisor\models.json' }
 $script  = Join-Path $root 'supervisor\supervisor.js'
@@ -41,10 +42,9 @@ if (-not $node) { throw 'node.exe not found on PATH' }
 New-Item -ItemType Directory -Force -Path $logDir | Out-Null
 
 # ---- stop anything that would fight for the ports --------------------------------
-$supProcs = Get-CimInstance Win32_Process -Filter "Name='node.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -like '*supervisor.js*' }
+$supProcs = Get-SupervisorProcess
 foreach ($p in $supProcs) {
-    Write-Host ("stopping previous supervisor pid {0}" -f $p.ProcessId) -ForegroundColor Yellow
+    Write-Host ("stopping previous supervisor pid {0} ({1})" -f $p.ProcessId, $p.Name) -ForegroundColor Yellow
     Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
 }
 if ($supProcs) { Start-Sleep -Seconds 2 }
@@ -58,24 +58,39 @@ if ($manual.Count -gt 0) {
     Start-Sleep -Seconds 2
 }
 
-# ---- optional idle override (passed through the environment-less CLI arg) --------
+# ---- resolve what will actually run ----------------------------------------------
+# Ports are NOT read straight off the entries: the unified schema allocates them from
+# ports.publicBase when an entry does not set publicPort, so ask the same code the
+# supervisor will use (Get-LocalModelPorts -> `supervisor.js --dump-models`).
 $cfgJson = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
-if ($IdleTimeoutSec -gt 0) { $cfgJson.idleTimeoutSec = $IdleTimeoutSec }
-$effectiveIdle = $cfgJson.idleTimeoutSec
-$pubPorts = ($cfgJson.models | ForEach-Object { $_.publicPort }) -join ', '
+$pubPorts = @(Get-LocalModelPorts -Config $Config)
+$effectiveIdle = if ($IdleTimeoutSec -gt 0) { $IdleTimeoutSec } else { $cfgJson.idleTimeoutSec }
+$modelNames = @($cfgJson.models | ForEach-Object {
+    if ($_.label) { $_.label } elseif ($_.name) { $_.name } else { $_.key }
+})
+$modelKinds = @($cfgJson.models | ForEach-Object { if ($_.url) { 'external' } else { 'managed' } })
+$modelList = for ($i = 0; $i -lt $modelNames.Count; $i++) {
+    "{0} [{1}] -> {2}" -f $modelNames[$i], $modelKinds[$i], $pubPorts[$i]
+}
 
 Write-Host '============================================================' -ForegroundColor Cyan
 Write-Host ' local model supervisor (lazy start / idle shutdown)' -ForegroundColor Cyan
 Write-Host '============================================================' -ForegroundColor Cyan
-Write-Host (" public ports : {0}   (DSH points here - no DSH change needed)" -f $pubPorts)
+Write-Host (" public ports : {0}   ({1} model(s); DSH points here)" -f ($pubPorts -join ', '), $modelNames.Count)
 Write-Host (" idle timeout : {0}s without inference -> model stopped, VRAM released" -f $effectiveIdle)
-Write-Host (" models       : {0}" -f (($cfgJson.models | ForEach-Object { "$($_.key) [$($_.label)]" }) -join '  |  '))
+Write-Host (" models       : {0}" -f ($modelList -join "`n                "))
 Write-Host (" log          : {0}" -f $outLog)
 Write-Host '------------------------------------------------------------'
 
-# Start-Process cannot pass an object, so hand the supervisor a temp config file.
-$tmpCfg = Join-Path $logDir 'supervisor.effective.json'
-$cfgJson | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tmpCfg -Encoding utf8
+# Only re-serialise the config when we actually need to change something; otherwise let the
+# supervisor read the real file so nothing is lost in a round-trip.
+if ($IdleTimeoutSec -gt 0) {
+    $cfgJson.idleTimeoutSec = $IdleTimeoutSec
+    $tmpCfg = Join-Path $logDir 'supervisor.effective.json'
+    $cfgJson | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $tmpCfg -Encoding utf8
+} else {
+    $tmpCfg = $Config
+}
 
 # Launch through a generated .cmd rather than Start-Process -RedirectStandardOutput:
 # redirecting from PowerShell leaves the caller holding the child's pipe handles, so the
@@ -92,7 +107,7 @@ Start-Process -FilePath $batFile -WindowStyle Hidden
 
 # ---- wait until every public port answers ---------------------------------------
 $ok = $true
-foreach ($port in $cfgJson.models.publicPort) {
+foreach ($port in $pubPorts) {
     $ready = $false
     for ($i = 0; $i -lt 40; $i++) {
         Start-Sleep -Milliseconds 500

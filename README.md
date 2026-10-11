@@ -330,7 +330,7 @@ one card, so this only helps when the models really do fit together.
 │   ├─ supervisor-status.ps1    status
 │   ├─ unload-local-models.ps1  release everything now
 │   ├─ export-dsh-routes.ps1   generate the DSH `providers:` block from models.json
-│   ├─ supervisor-ports.ps1     shared helper: read the port list out of the config
+│   ├─ supervisor-helpers.ps1   shared helpers: read the port list out of the config, find supervisor processes
 │   ├─ install-autostart.ps1    start at logon (scheduled task; unnecessary once the plugin is used)
 │   └─ uninstall-autostart.ps1  remove it
 └─ LICENSE

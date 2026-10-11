@@ -11,7 +11,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 # Ports come from the supervisor config so any number of models / any publicBase works.
-. (Join-Path $PSScriptRoot 'supervisor-ports.ps1')
+. (Join-Path $PSScriptRoot 'supervisor-helpers.ps1')
 if (-not $Ports -or $Ports.Count -eq 0) { $Ports = Get-LocalModelPorts -Config $Config }
 
 $status = $null
